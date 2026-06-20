@@ -94,21 +94,26 @@ class FetchWorker(QThread):
 
             # 2. Analyze relevance & impact
             if all_articles:
-                self.progress.emit("🧠 Ініціалізація аналізатора FinBERT…")
+                self.progress.emit("🧠 Ініціалізація аналізаторів…")
                 try:
-                    from core.analyzer import FinancialAnalyzer, calculate_relevance
-                    analyzer = FinancialAnalyzer()
+                    from core.analyzer import FinancialAnalyzer
+                    from core.classifier import NewsClassifierZeroShot
                     
+                    analyzer = FinancialAnalyzer()
+                    zeroshot_classifier = NewsClassifierZeroShot()
+                    
+                    self.progress.emit("🧠 Завантаження Zero-Shot класифікатора (mDeBERTa)…")
+                    zeroshot_classifier._lazy_init()
+
                     total = len(all_articles)
                     for idx, article in enumerate(all_articles):
                         self.progress.emit(f"🧠 - Аналіз впливу та релевантності ({idx + 1}/{total})…")
                         
-                        # Relevance calculation
-                        article.relevance = calculate_relevance(
+                        # Relevance calculation (Zero-Shot)
+                        article.relevance = zeroshot_classifier.predict(
                             article.title,
                             article.content or article.summary,
-                            self.ticker,
-                            self.company_name
+                            self.company_name or self.ticker
                         )
                         
                         # Impact (FinBERT sentiment analysis)
@@ -118,6 +123,57 @@ class FetchWorker(QThread):
                     self.progress.emit(f"❌ Помилка аналізу: {exc}")
 
         self.finished.emit(all_articles)
+
+
+class ReclassifyWorker(QThread):
+    """Background thread that reclassifies all database articles using the Zero-Shot model."""
+    progress = pyqtSignal(str)      # status message
+    finished = pyqtSignal(int)      # number of updated articles
+    error = pyqtSignal(str)         # error message
+
+    def __init__(self, db, parent=None):
+        super().__init__(parent)
+        self.db = db
+
+    def run(self):
+        try:
+            from core.classifier import NewsClassifierZeroShot
+            from core.database import Database
+            
+            db_thread = Database()
+            conn = db_thread._connect()
+            cursor = conn.cursor()
+            cursor.execute("SELECT id, title, content, summary, company_name, company_ticker FROM articles")
+            rows = cursor.fetchall()
+            
+            total = len(rows)
+            if total == 0:
+                self.finished.emit(0)
+                return
+
+            self.progress.emit("🧠 Ініціалізація моделі...")
+            zeroshot = NewsClassifierZeroShot()
+            zeroshot._lazy_init()
+            classifier_func = lambda t, c, name, ticker: zeroshot.predict(t, c, name or ticker)
+
+            updated_count = 0
+            for idx, (art_id, title, content, summary, name, ticker) in enumerate(rows):
+                self.progress.emit(f"🧠 Класифікація новин ({idx + 1}/{total})...")
+                score = classifier_func(title, content or summary, name, ticker)
+                
+                cursor.execute(
+                    "UPDATE articles SET relevance = ? WHERE id = ?",
+                    (score, art_id)
+                )
+                updated_count += 1
+                
+                if updated_count % 20 == 0:
+                    conn.commit()
+            
+            conn.commit()
+            self.finished.emit(updated_count)
+        except Exception as e:
+            self.error.emit(str(e))
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -134,6 +190,7 @@ class MainWindow(QMainWindow):
         self._parsers = []
         self._current_articles: List[NewsArticle] = []
         self._fetch_worker: Optional[FetchWorker] = None
+        self._reclass_worker = None
 
         self._init_parsers()
         self._init_ui()
@@ -232,6 +289,12 @@ class MainWindow(QMainWindow):
         api_keys_action = QAction("API ключі…", self)
         api_keys_action.triggered.connect(self._open_settings)
         settings_menu.addAction(api_keys_action)
+
+        # ── Neural Network Menu ──
+        nn_menu = menubar.addMenu("Нейромережа")
+        reclassify_action = QAction("Перерахувати релевантність новин", self)
+        reclassify_action.triggered.connect(self._reclassify_database)
+        nn_menu.addAction(reclassify_action)
 
         # ── Help menu ──
         help_menu = menubar.addMenu("Довідка")
@@ -344,7 +407,7 @@ class MainWindow(QMainWindow):
         """Re-query database with current filter settings."""
         self._refresh_from_db()
 
-    def _refresh_from_db(self):
+    def _refresh_from_db(self, select_article_id: Optional[str] = None):
         """Query articles from database matching dates and filter by company query."""
         filters = self.search_panel.get_filters()
 
@@ -392,7 +455,16 @@ class MainWindow(QMainWindow):
         self._current_articles = articles
         self.news_panel.load_articles(articles)
         self.count_status.setText(f"Статей: {len(articles)}")
-        self.preview_panel.clear()
+        
+        if select_article_id:
+            self.news_panel.select_article_by_id(select_article_id)
+            selected_article = next((a for a in articles if a.id == select_article_id), None)
+            if selected_article:
+                self.preview_panel.show_article(selected_article)
+            else:
+                self.preview_panel.clear()
+        else:
+            self.preview_panel.clear()
 
     # ── Article selection ─────────────────────────────────────────
     def _on_article_selected(self, article):
@@ -425,9 +497,71 @@ class MainWindow(QMainWindow):
         )
 
     # ── Cleanup ───────────────────────────────────────────────────
+    def _reclassify_database(self):
+        """Apply the Zero-Shot neural network model to all news in the database."""
+        if self._reclass_worker and self._reclass_worker.isRunning():
+            QMessageBox.warning(self, "Зайнято", "Перекласифікація вже виконується.")
+            return
+
+        reply = QMessageBox.question(
+            self, "Перерахунок релевантності",
+            "Ви впевнені, що хочете перерахувати релевантність для ВСІХ новин у базі даних за допомогою готової Zero-Shot нейромережі (mDeBERTa)?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+
+        # Progress dialog
+        self._reclass_progress = QProgressDialog(
+            "Ініціалізація моделі...", "Скасувати", 0, 0, self
+        )
+        self._reclass_progress.setWindowTitle("Перекласифікація")
+        self._reclass_progress.setWindowModality(Qt.WindowModality.WindowModal)
+        self._reclass_progress.setMinimumDuration(0)
+        self._reclass_progress.show()
+        
+        # Create and start worker
+        self._reclass_worker = ReclassifyWorker(self.db, self)
+        self._reclass_worker.progress.connect(self._on_reclass_progress)
+        self._reclass_worker.finished.connect(self._on_reclass_finished)
+        self._reclass_worker.error.connect(self._on_reclass_error)
+        
+        self._reclass_progress.canceled.connect(self._reclass_worker.terminate)
+        
+        self._reclass_worker.start()
+        self.status_label.setText("Перерахунок релевантності...")
+
+    def _on_reclass_progress(self, message: str):
+        if hasattr(self, '_reclass_progress') and self._reclass_progress:
+            self._reclass_progress.setLabelText(message)
+        self.status_label.setText(message)
+
+    def _on_reclass_finished(self, count: int):
+        if hasattr(self, '_reclass_progress') and self._reclass_progress:
+            self._reclass_progress.close()
+            self._reclass_progress = None
+            
+        QMessageBox.information(
+            self, "Успіх",
+            f"Перекласифіковано {count} новин за допомогою Zero-Shot моделі."
+        )
+        self.status_label.setText(f"Перекласифіковано {count} новин.")
+        self._refresh_from_db()
+
+    def _on_reclass_error(self, error_msg: str):
+        if hasattr(self, '_reclass_progress') and self._reclass_progress:
+            self._reclass_progress.close()
+            self._reclass_progress = None
+            
+        self.status_label.setText(f"Помилка: {error_msg}")
+        QMessageBox.critical(self, "Помилка класифікації", error_msg)
+
     def closeEvent(self, event):
         """Ensure background threads are stopped on exit."""
         if self._fetch_worker and self._fetch_worker.isRunning():
             self._fetch_worker.terminate()
             self._fetch_worker.wait(3000)
+        if self._reclass_worker and self._reclass_worker.isRunning():
+            self._reclass_worker.terminate()
+            self._reclass_worker.wait(3000)
         event.accept()

@@ -142,3 +142,18 @@ class NewsPanel(QWidget):
         if len(selected) == 1:
             self.article_selected.emit(selected[0])
         self.articles_selected.emit(selected)
+
+    def select_article_by_id(self, article_id: str):
+        """Select the row matching the given article ID."""
+        self.table.blockSignals(True)
+        try:
+            for row in range(self.table.rowCount()):
+                date_item = self.table.item(row, 0)
+                if date_item is not None:
+                    idx = date_item.data(Qt.ItemDataRole.UserRole)
+                    if idx is not None and 0 <= idx < len(self._articles):
+                        if self._articles[idx].id == article_id:
+                            self.table.selectRow(row)
+                            break
+        finally:
+            self.table.blockSignals(False)

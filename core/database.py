@@ -75,7 +75,6 @@ class Database:
                     sentiment       TEXT NOT NULL DEFAULT '',
                     tags            TEXT NOT NULL DEFAULT '',
                     user_notes      TEXT NOT NULL DEFAULT '',
-                    is_edited       INTEGER NOT NULL DEFAULT 0,
                     is_starred      INTEGER NOT NULL DEFAULT 0
                 )
             """)
