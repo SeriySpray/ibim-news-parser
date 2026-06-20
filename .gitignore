@@ -1,0 +1,16 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Local configuration and databases (contains private API keys & temporary local data)
+data/config.json
+data/news.db
+data/exports/
+
+# IDE and tool configs
+.idea/
+.vscode/
+.gemini/
+.gitattributes
