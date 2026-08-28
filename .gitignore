@@ -1,13 +1,21 @@
 # Byte-compiled / optimized / DLL files
 __pycache__/
-*.pyc
-*.pyo
+*.py[cod]
+*$py.class
 *.pyd
 
-# Local configuration and databases (contains private API keys & temporary local data)
-data/config.json
-data/news.db
-data/exports/
+# Virtual Environments
+.venv/
+venv/
+env/
+ENV/
+
+# Local data, logs, databases, model checkpoints & private config
+data/
+*.log
+*.sqlite3
+*.db
+*.pth
 
 # IDE and tool configs
 .idea/

@@ -35,14 +35,16 @@ class NewsPanel(QWidget):
 
         # Таблиця новин
         self.table = QTableWidget()
-        self.table.setColumnCount(5)
-        self.table.setHorizontalHeaderLabels(['Дата', 'Заголовок', 'Джерело', 'Релевантність', 'Вплив'])
+        self.table.setColumnCount(7)
+        self.table.setHorizontalHeaderLabels(['Дата', 'Заголовок', 'Джерело', 'Релевантність', 'Вплив', 'Реал. зміна', 'Прогноз'])
 
         # Ширина колонок
         self.table.setColumnWidth(0, 95)
         self.table.setColumnWidth(2, 120)
         self.table.setColumnWidth(3, 110)
         self.table.setColumnWidth(4, 75)
+        self.table.setColumnWidth(5, 95)
+        self.table.setColumnWidth(6, 85)
         header = self.table.horizontalHeader()
         header.setStretchLastSection(False)
         header.setSectionResizeMode(1, header.ResizeMode.Stretch)
@@ -109,6 +111,34 @@ class NewsPanel(QWidget):
                 imp_item.setForeground(QColor('#8b8ba3'))
                 
             self.table.setItem(idx, 4, imp_item)
+
+            # Column 5 — реальна зміна акцій
+            real_val = getattr(article, 'real_stock_return', None)
+            if real_val is not None and real_val != 0.0:
+                real_item = QTableWidgetItem(f"{real_val:+.2f}%")
+                if real_val > 0.0:
+                    real_item.setForeground(QColor('#00cec9'))
+                else:
+                    real_item.setForeground(QColor('#ff7675'))
+            else:
+                real_item = QTableWidgetItem("—")
+                real_item.setForeground(QColor('#8b8ba3'))
+            real_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+            self.table.setItem(idx, 5, real_item)
+
+            # Column 6 — прогноз зміни акцій
+            pred_val = getattr(article, 'predicted_stock_return', None)
+            if pred_val is not None and pred_val != 0.0:
+                pred_item = QTableWidgetItem(f"{pred_val:+.2f}%")
+                if pred_val > 0.0:
+                    pred_item.setForeground(QColor('#00cec9'))
+                else:
+                    pred_item.setForeground(QColor('#ff7675'))
+            else:
+                pred_item = QTableWidgetItem("—")
+                pred_item.setForeground(QColor('#8b8ba3'))
+            pred_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+            self.table.setItem(idx, 6, pred_item)
 
         self.table.setSortingEnabled(True)
         self.count_label.setText(f'Завантажено: {len(articles)} новин')

@@ -44,6 +44,7 @@ class Database:
             self.connection = sqlite3.connect(
                 str(self.db_path),
                 detect_types=sqlite3.PARSE_DECLTYPES,
+                check_same_thread=False
             )
             self.connection.row_factory = sqlite3.Row
         return self.connection
@@ -91,14 +92,34 @@ class Database:
                 ON articles (published_at)
             """)
             
+            # Create stock_prices table
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS stock_prices (
+                    ticker  TEXT NOT NULL,
+                    date    TEXT NOT NULL,
+                    open    REAL NOT NULL,
+                    close   REAL NOT NULL,
+                    high    REAL NOT NULL,
+                    low     REAL NOT NULL,
+                    volume  INTEGER NOT NULL,
+                    PRIMARY KEY (ticker, date)
+                )
+            """)
+
             # Check and add new columns dynamically if they don't exist
             cursor = conn.cursor()
             cursor.execute("PRAGMA table_info(articles)")
             columns = [row[1] for row in cursor.fetchall()]
+            if 'is_edited' not in columns:
+                conn.execute("ALTER TABLE articles ADD COLUMN is_edited INTEGER DEFAULT 0")
             if 'relevance' not in columns:
                 conn.execute("ALTER TABLE articles ADD COLUMN relevance REAL DEFAULT 0.0")
             if 'impact' not in columns:
                 conn.execute("ALTER TABLE articles ADD COLUMN impact REAL DEFAULT 0.0")
+            if 'real_stock_return' not in columns:
+                conn.execute("ALTER TABLE articles ADD COLUMN real_stock_return REAL DEFAULT NULL")
+            if 'predicted_stock_return' not in columns:
+                conn.execute("ALTER TABLE articles ADD COLUMN predicted_stock_return REAL DEFAULT NULL")
                 
             conn.commit()
             logger.info("Database initialised at %s", self.db_path)
@@ -144,8 +165,11 @@ class Database:
         article.user_notes = row["user_notes"]
         article.is_edited = bool(row["is_edited"])
         article.is_starred = bool(row["is_starred"])
-        article.relevance = row["relevance"] if "relevance" in row.keys() else 0.0
-        article.impact = row["impact"] if "impact" in row.keys() else 0.0
+        article.relevance = row["relevance"] if "relevance" in row.keys() and row["relevance"] is not None else 0.0
+        article.impact = row["impact"] if "impact" in row.keys() and row["impact"] is not None else 0.0
+        # Зберігаємо None як «ще не зіставлено» — не замінюємо на 0.0
+        article.real_stock_return = row["real_stock_return"] if "real_stock_return" in row.keys() else None
+        article.predicted_stock_return = row["predicted_stock_return"] if "predicted_stock_return" in row.keys() else None
         return article
 
     # ── CRUD ──────────────────────────────────────────────────────────
@@ -168,8 +192,8 @@ class Database:
                     id, company_ticker, company_name, title, content,
                     summary, source, source_url, published_at, fetched_at,
                     sentiment, tags, user_notes, is_edited, is_starred,
-                    relevance, impact
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    relevance, impact, real_stock_return, predicted_stock_return
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     article.id,
@@ -189,6 +213,8 @@ class Database:
                     int(article.is_starred),
                     article.relevance,
                     article.impact,
+                    article.real_stock_return,
+                    article.predicted_stock_return,
                 ),
             )
             conn.commit()
@@ -247,7 +273,9 @@ class Database:
                     is_edited      = ?,
                     is_starred     = ?,
                     relevance      = ?,
-                    impact         = ?
+                    impact         = ?,
+                    real_stock_return = ?,
+                    predicted_stock_return = ?
                 WHERE id = ?
                 """,
                 (
@@ -267,6 +295,8 @@ class Database:
                     int(article.is_starred),
                     article.relevance,
                     article.impact,
+                    article.real_stock_return,
+                    article.predicted_stock_return,
                     article.id,
                 ),
             )

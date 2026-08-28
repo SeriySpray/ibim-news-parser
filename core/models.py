@@ -32,6 +32,8 @@ class NewsArticle:
     is_starred: bool = False
     relevance: float = 0.0
     impact: float = 0.0
+    real_stock_return: Optional[float] = None        # None = ще не зіставлено
+    predicted_stock_return: Optional[float] = None  # None = ще не спрогнозовано
 
     # ── Tag helpers ────────────────────────────────────────────────
     @property
@@ -70,6 +72,8 @@ class NewsArticle:
             "is_starred": self.is_starred,
             "relevance": self.relevance,
             "impact": self.impact,
+            "real_stock_return": self.real_stock_return,
+            "predicted_stock_return": self.predicted_stock_return,
         }
 
     @classmethod
@@ -118,6 +122,8 @@ class NewsArticle:
         article.is_starred = data.get("is_starred", False)
         article.relevance = float(data.get("relevance", 0.0))
         article.impact = float(data.get("impact", 0.0))
+        article.real_stock_return = float(data.get("real_stock_return", 0.0))
+        article.predicted_stock_return = float(data.get("predicted_stock_return", 0.0))
 
         return article
 

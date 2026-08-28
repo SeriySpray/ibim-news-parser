@@ -6,6 +6,7 @@ Handles data fetching via background QThread, database operations, and filtering
 """
 
 import os
+import logging
 from datetime import datetime
 from typing import List, Optional
 
@@ -17,6 +18,8 @@ from PyQt6.QtWidgets import (
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QDate
 from PyQt6.QtGui import QAction, QFont
 
+logger = logging.getLogger(__name__)
+
 from config import Config
 from core.models import NewsArticle
 from core.database import Database
@@ -24,6 +27,8 @@ from ui.search_panel import SearchPanel
 from ui.news_panel import NewsPanel
 from ui.preview_panel import PreviewPanel
 from ui.settings_dialog import SettingsDialog
+from ui.auto_train_panel import AutoTrainPanel
+from ui.model_eval_panel import ModelEvalPanel
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -51,6 +56,8 @@ class FetchWorker(QThread):
         all_articles: List[NewsArticle] = []
 
         for parser in self.parsers:
+            if self.isInterruptionRequested():
+                return
             source_name = parser.get_source_name()
             try:
                 if not parser.is_configured():
@@ -71,6 +78,7 @@ class FetchWorker(QThread):
                     f"✅ {source_name}: отримано {len(articles)} новин"
                 )
             except Exception as exc:
+                logger.warning("Parser %s error: %s", source_name, exc)
                 self.progress.emit(f"❌ {source_name}: {exc}")
 
         # Web scrape full text and analyze articles if any were fetched
@@ -83,43 +91,98 @@ class FetchWorker(QThread):
                 total = len(all_articles)
                 for idx, article in enumerate(all_articles):
                     self.progress.emit(f"🌐 Скрапінг повного тексту ({idx + 1}/{total})…")
-                    full_text = scrape_article_text(article.source_url)
-                    if full_text and len(full_text) > len(article.content or ""):
-                        article.content = full_text
-                        scraped_articles.append(article)
+                    try:
+                        full_text = scrape_article_text(article.source_url)
+                        if full_text and len(full_text) > len(article.content or ""):
+                            article.content = full_text
+                    except Exception as exc:
+                        logger.debug("Scraper error for %s: %s", article.source_url, exc)
+                    scraped_articles.append(article)
             except Exception as exc:
-                self.progress.emit(f"❌ Помилка скрапінгу: {exc}")
+                self.progress.emit(f"⚠️ Помилка ініціалізації скрапінгу: {exc}")
+                # У разі критичної помилки залишаємо вихідні статті
+                scraped_articles = all_articles
 
             all_articles = scraped_articles
 
             # 2. Analyze relevance & impact
             if all_articles:
-                self.progress.emit("🧠 Ініціалізація аналізаторів…")
                 try:
-                    from core.analyzer import FinancialAnalyzer
+                    from core.analyzer import FinancialAnalyzer, calculate_relevance
                     from core.classifier import NewsClassifierZeroShot
-                    
+
+                    # ── FinBERT ──
                     analyzer = FinancialAnalyzer()
+                    self.progress.emit("⏳ Завантаження FinBERT (може тривати до 5 хв при першому запуску)…")
+                    try:
+                        analyzer._lazy_init()
+                        self.progress.emit("✅ FinBERT завантажено.")
+                    except Exception as e:
+                        logger.error("FinBERT init failed: %s", e)
+                        self.progress.emit(f"⚠️ FinBERT не завантажився: {e}")
+                        analyzer = None
+
+                    if self.isInterruptionRequested():
+                        self.finished.emit(all_articles)
+                        return
+
+                    # ── mDeBERTa Zero-Shot ──
                     zeroshot_classifier = NewsClassifierZeroShot()
-                    
-                    self.progress.emit("🧠 Завантаження Zero-Shot класифікатора (mDeBERTa)…")
-                    zeroshot_classifier._lazy_init()
+                    use_zeroshot = False
+                    self.progress.emit("⏳ Завантаження mDeBERTa Zero-Shot (~1 ГБ, може тривати до 10 хв)…")
+                    try:
+                        zeroshot_classifier._lazy_init()
+                        use_zeroshot = True
+                        self.progress.emit("✅ mDeBERTa завантажено.")
+                    except Exception as e:
+                        logger.error("mDeBERTa init failed: %s", e)
+                        self.progress.emit(f"⚠️ mDeBERTa не завантажився, використовується локальний розрахунок: {e}")
+
+                    if self.isInterruptionRequested():
+                        self.finished.emit(all_articles)
+                        return
 
                     total = len(all_articles)
                     for idx, article in enumerate(all_articles):
-                        self.progress.emit(f"🧠 - Аналіз впливу та релевантності ({idx + 1}/{total})…")
-                        
-                        # Relevance calculation (Zero-Shot)
-                        article.relevance = zeroshot_classifier.predict(
-                            article.title,
-                            article.content or article.summary,
-                            self.company_name or self.ticker
-                        )
-                        
-                        # Impact (FinBERT sentiment analysis)
-                        text_for_sentiment = (article.title or "") + ". " + (article.summary or article.content or "")
-                        article.impact = analyzer.analyze_sentiment(text_for_sentiment)
+                        if self.isInterruptionRequested():
+                            break
+                        self.progress.emit(f"🧠 [{idx + 1}/{total}] {article.title[:55]}…")
+
+                        # Relevance
+                        try:
+                            if use_zeroshot:
+                                article.relevance = zeroshot_classifier.predict(
+                                    article.title,
+                                    article.content or article.summary or "",
+                                    self.company_name or self.ticker
+                                )
+                            else:
+                                article.relevance = calculate_relevance(
+                                    article.title, article.content or article.summary or "",
+                                    self.ticker, self.company_name
+                                )
+                        except Exception as e:
+                            logger.warning("Relevance failed for '%s': %s", article.title[:40], e)
+
+                        # Sentiment
+                        if analyzer is not None:
+                            try:
+                                text_for_sentiment = (article.title or "") + ". " + (article.summary or article.content or "")
+                                article.impact = analyzer.analyze_sentiment(text_for_sentiment)
+                            except Exception as e:
+                                logger.warning("FinBERT failed for '%s': %s", article.title[:40], e)
+
+                        # Predict stock return using trained model
+                        try:
+                            from core.predictor import predict_stock_return
+                            pred_val = predict_stock_return(article.title, article.summary, article.content)
+                            if pred_val is not None:
+                                article.predicted_stock_return = pred_val
+                        except Exception as e:
+                            logger.debug("On-the-fly prediction failed: %s", e)
+
                 except Exception as exc:
+                    logger.error("Analysis init error: %s", exc, exc_info=True)
                     self.progress.emit(f"❌ Помилка аналізу: {exc}")
 
         self.finished.emit(all_articles)
@@ -176,6 +239,133 @@ class ReclassifyWorker(QThread):
             self.error.emit(str(e))
 
 
+class AlignPricesWorker(QThread):
+    """Background thread that fetches stock prices and aligns news articles with returns."""
+    progress = pyqtSignal(str)
+    finished = pyqtSignal(int)
+    error = pyqtSignal(str)
+
+    def __init__(self, db, parent=None):
+        super().__init__(parent)
+        self.db = db
+
+    def run(self):
+        try:
+            from core.database import Database
+            from core.market_data import align_article_with_return
+            
+            db_thread = Database()
+            conn = db_thread._connect()
+            cursor = conn.cursor()
+            cursor.execute("SELECT id, company_ticker FROM articles WHERE company_ticker != ''")
+            rows = cursor.fetchall()
+            
+            total = len(rows)
+            if total == 0:
+                self.finished.emit(0)
+                return
+
+            aligned_count = 0
+            for idx, row_data in enumerate(rows):
+                if self.isInterruptionRequested():
+                    break
+                art_id = row_data["id"]
+                self.progress.emit(f"📈 Зіставлення новин з цінами акцій ({idx + 1}/{total})…")
+                try:
+                    res = align_article_with_return(db_thread, art_id)
+                    if res is not None:
+                        aligned_count += 1
+                except Exception as e:
+                    logger.warning("Failed to align article %s: %s", art_id, e)
+            
+            self.finished.emit(aligned_count)
+        except Exception as e:
+            logger.error("AlignPricesWorker error: %s", e, exc_info=True)
+            self.error.emit(str(e))
+
+
+class TrainPredictorWorker(QThread):
+    """Background thread that trains the PyTorch return predictor model."""
+    progress = pyqtSignal(str)
+    finished = pyqtSignal(str)
+    error = pyqtSignal(str)
+
+    def __init__(self, db, parent=None):
+        super().__init__(parent)
+        self.db = db
+
+    def run(self):
+        try:
+            from core.database import Database
+            from core.predictor import train_predictor_model
+            
+            db_thread = Database()
+            self.progress.emit("🧠 Ініціалізація FinBERT та підготовка даних…")
+            result_msg = train_predictor_model(db_thread, progress_callback=self.progress.emit)
+            self.finished.emit(result_msg)
+        except Exception as e:
+            self.error.emit(str(e))
+
+
+class PredictWorker(QThread):
+    """Background thread that runs stock return predictions on all news."""
+    progress = pyqtSignal(str)
+    finished = pyqtSignal(int)
+    error = pyqtSignal(str)
+
+    def __init__(self, db, parent=None):
+        super().__init__(parent)
+        self.db = db
+
+    def run(self):
+        try:
+            from core.database import Database
+            from core.predictor import predict_stock_return
+            
+            db_thread = Database()
+            conn = db_thread._connect()
+            cursor = conn.cursor()
+            cursor.execute("SELECT id, title, summary, content FROM articles")
+            rows = cursor.fetchall()
+            
+            total = len(rows)
+            if total == 0:
+                self.finished.emit(0)
+                return
+
+            pred_count = 0
+            for idx, row_data in enumerate(rows):
+                if self.isInterruptionRequested():
+                    break
+                art_id = row_data["id"]
+                title = row_data["title"]
+                summary = row_data["summary"]
+                content = row_data["content"]
+                self.progress.emit(f"🔮 Прогнозування змін цін акцій ({idx + 1}/{total})…")
+                try:
+                    pred_val = predict_stock_return(title, summary, content)
+                    if pred_val is not None:
+                        cursor.execute(
+                            "UPDATE articles SET predicted_stock_return = ? WHERE id = ?",
+                            (pred_val, art_id)
+                        )
+                        pred_count += 1
+                        
+                        if pred_count % 20 == 0:
+                            conn.commit()
+                except Exception as e:
+                    logger.warning("Prediction failed for article %s: %s", art_id, e)
+            
+            try:
+                conn.commit()
+            except Exception as e:
+                logger.error("Failed final commit in PredictWorker: %s", e)
+            self.finished.emit(pred_count)
+        except Exception as e:
+            logger.error("PredictWorker error: %s", e, exc_info=True)
+            self.error.emit(str(e))
+
+
 # ═══════════════════════════════════════════════════════════════════
 #  Main Window
 # ═══════════════════════════════════════════════════════════════════
@@ -191,11 +381,16 @@ class MainWindow(QMainWindow):
         self._current_articles: List[NewsArticle] = []
         self._fetch_worker: Optional[FetchWorker] = None
         self._reclass_worker = None
+        self._align_worker = None
+        self._train_worker = None
+        self._predict_worker = None
 
         self._init_parsers()
         self._init_ui()
         self._init_menu()
         self._connect_signals()
+        self._init_auto_panel()
+        self._init_eval_panel()
 
         # Initial refresh
         self._refresh_from_db()
@@ -229,7 +424,39 @@ class MainWindow(QMainWindow):
         # Central widget
         central = QWidget()
         self.setCentralWidget(central)
-        main_layout = QVBoxLayout(central)
+        root_layout = QVBoxLayout(central)
+        root_layout.setContentsMargins(0, 0, 0, 0)
+        root_layout.setSpacing(0)
+
+        # ── Tab widget верхнього рівня ──
+        from PyQt6.QtWidgets import QTabWidget
+        self.top_tabs = QTabWidget()
+        self.top_tabs.setStyleSheet("""
+            QTabWidget::pane {
+                border: none;
+                background: #1e1e24;
+            }
+            QTabBar::tab {
+                background: #2b2b36;
+                color: #8b8ba3;
+                border: none;
+                padding: 8px 22px;
+                font-size: 11px;
+                font-weight: bold;
+                min-width: 90px;
+            }
+            QTabBar::tab:selected {
+                background: #1e1e24;
+                color: #a29bfe;
+                border-bottom: 2px solid #a29bfe;
+            }
+            QTabBar::tab:hover:!selected { background: #35354a; }
+        """)
+        root_layout.addWidget(self.top_tabs)
+
+        # ── Вкладка 1: Пошук / Новини ──
+        news_tab = QWidget()
+        main_layout = QVBoxLayout(news_tab)
         main_layout.setContentsMargins(0, 0, 0, 0)
         main_layout.setSpacing(0)
 
@@ -241,6 +468,7 @@ class MainWindow(QMainWindow):
         self.splitter = QSplitter(Qt.Orientation.Horizontal)
         self.news_panel = NewsPanel()
         self.preview_panel = PreviewPanel()
+        self.preview_panel.set_database(self.db)
 
         self.splitter.addWidget(self.news_panel)
         self.splitter.addWidget(self.preview_panel)
@@ -248,6 +476,9 @@ class MainWindow(QMainWindow):
         self.splitter.setStretchFactor(1, 55)
 
         main_layout.addWidget(self.splitter, 1)
+        self.top_tabs.addTab(news_tab, "🔍  Пошук новин")
+
+        # ── Вкладка 2: Авто-навчання — буде додана в _init_auto_panel() ──
 
         # Status bar
         self.status_bar = QStatusBar()
@@ -265,6 +496,26 @@ class MainWindow(QMainWindow):
             x = (geo.width() - self.width()) // 2 + geo.x()
             y = (geo.height() - self.height()) // 2 + geo.y()
             self.move(x, y)
+
+    # ── Auto train panel init ──────────────────────────────────────
+    def _init_auto_panel(self):
+        """Create and add the AutoTrainPanel as the second top-level tab."""
+        self.auto_panel = AutoTrainPanel(parsers=self._parsers, db=self.db)
+        self.auto_panel.training_finished.connect(self._on_auto_training_finished)
+        self.top_tabs.addTab(self.auto_panel, "🤖  Авто")
+
+    def _init_eval_panel(self):
+        """Create and add the ModelEvalPanel as the third top-level tab."""
+        self.eval_panel = ModelEvalPanel(db=self.db)
+        self.top_tabs.addTab(self.eval_panel, "📊  Оцінка моделі")
+
+    def _on_auto_training_finished(self):
+        """Called when the auto-train cycle completes — refresh news panel."""
+        self._refresh_from_db()
+        # Auto-refresh the evaluation panel after training
+        if hasattr(self, 'eval_panel'):
+            self.eval_panel.refresh()
+        self.status_label.setText("Авто-навчання завершено. Список новин оновлено.")
 
     # ── Menu bar ──────────────────────────────────────────────────
     def _init_menu(self):
@@ -295,6 +546,20 @@ class MainWindow(QMainWindow):
         reclassify_action = QAction("Перерахувати релевантність новин", self)
         reclassify_action.triggered.connect(self._reclassify_database)
         nn_menu.addAction(reclassify_action)
+
+        nn_menu.addSeparator()
+
+        align_prices_action = QAction("Зіставити новини з котируваннями акцій", self)
+        align_prices_action.triggered.connect(self._align_prices_database)
+        nn_menu.addAction(align_prices_action)
+
+        train_predictor_action = QAction("Навчити модель прогнозування (PyTorch)", self)
+        train_predictor_action.triggered.connect(self._train_predictor_model)
+        nn_menu.addAction(train_predictor_action)
+
+        run_prediction_action = QAction("Спрогнозувати рух акцій", self)
+        run_prediction_action.triggered.connect(self._run_predictor_model)
+        nn_menu.addAction(run_prediction_action)
 
         # ── Help menu ──
         help_menu = menubar.addMenu("Довідка")
@@ -358,7 +623,7 @@ class MainWindow(QMainWindow):
         self._fetch_worker.finished.connect(self._on_fetch_finished)
         self._fetch_worker.error.connect(self._on_fetch_error)
 
-        self._progress.canceled.connect(self._fetch_worker.terminate)
+        self._progress.canceled.connect(self._fetch_worker.requestInterruption)
 
         self._fetch_worker.start()
         self.status_label.setText("Завантаження…")
@@ -526,7 +791,7 @@ class MainWindow(QMainWindow):
         self._reclass_worker.finished.connect(self._on_reclass_finished)
         self._reclass_worker.error.connect(self._on_reclass_error)
         
-        self._reclass_progress.canceled.connect(self._reclass_worker.terminate)
+        self._reclass_progress.canceled.connect(self._reclass_worker.requestInterruption)
         
         self._reclass_worker.start()
         self.status_label.setText("Перерахунок релевантності...")
@@ -556,12 +821,171 @@ class MainWindow(QMainWindow):
         self.status_label.setText(f"Помилка: {error_msg}")
         QMessageBox.critical(self, "Помилка класифікації", error_msg)
 
+    def _align_prices_database(self):
+        """Fetch stock prices and align return labels for database news."""
+        if self._align_worker and self._align_worker.isRunning():
+            QMessageBox.warning(self, "Зайнято", "Зіставлення цін вже виконується.")
+            return
+
+        reply = QMessageBox.question(
+            self, "Зіставлення котирувань",
+            "Ви впевнені, що хочете завантажити ціни акцій та зіставити їх з новинами в базі даних?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+
+        self._align_progress = QProgressDialog(
+            "Підготовка зіставлення...", "Скасувати", 0, 0, self
+        )
+        self._align_progress.setWindowTitle("Зіставлення цін")
+        self._align_progress.setWindowModality(Qt.WindowModality.WindowModal)
+        self._align_progress.setMinimumDuration(0)
+        self._align_progress.show()
+
+        self._align_worker = AlignPricesWorker(self.db, self)
+        self._align_worker.progress.connect(self._on_align_progress)
+        self._align_worker.finished.connect(self._on_align_finished)
+        self._align_worker.error.connect(self._on_align_error)
+
+        self._align_progress.canceled.connect(self._align_worker.requestInterruption)
+        self._align_worker.start()
+        self.status_label.setText("Завантаження цін та зіставлення...")
+
+    def _on_align_progress(self, message: str):
+        if hasattr(self, '_align_progress') and self._align_progress:
+            self._align_progress.setLabelText(message)
+        self.status_label.setText(message)
+
+    def _on_align_finished(self, count: int):
+        if hasattr(self, '_align_progress') and self._align_progress:
+            self._align_progress.close()
+            self._align_progress = None
+        QMessageBox.information(
+            self, "Успіх",
+            f"Зіставлено {count} новин з реальними цінами акцій та розраховано прибутковість."
+        )
+        self.status_label.setText(f"Зіставлено {count} новин.")
+        self._refresh_from_db()
+
+    def _on_align_error(self, error_msg: str):
+        if hasattr(self, '_align_progress') and self._align_progress:
+            self._align_progress.close()
+            self._align_progress = None
+        self.status_label.setText(f"Помилка: {error_msg}")
+        QMessageBox.critical(self, "Помилка зіставлення", error_msg)
+
+    def _train_predictor_model(self):
+        """Train the PyTorch neural network return predictor model."""
+        if self._train_worker and self._train_worker.isRunning():
+            QMessageBox.warning(self, "Зайнято", "Навчання моделі вже виконується.")
+            return
+
+        reply = QMessageBox.question(
+            self, "Навчання моделі",
+            "Ви впевнені, що хочете запустити навчання нейромережі на зіставлених даних?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+
+        self._train_progress = QProgressDialog(
+            "Ініціалізація навчання...", "Скасувати", 0, 0, self
+        )
+        self._train_progress.setWindowTitle("Навчання моделі")
+        self._train_progress.setWindowModality(Qt.WindowModality.WindowModal)
+        self._train_progress.setMinimumDuration(0)
+        self._train_progress.show()
+
+        self._train_worker = TrainPredictorWorker(self.db, self)
+        self._train_worker.progress.connect(self._on_train_progress)
+        self._train_worker.finished.connect(self._on_train_finished)
+        self._train_worker.error.connect(self._on_train_error)
+
+        self._train_progress.canceled.connect(self._train_worker.requestInterruption)
+        self._train_worker.start()
+        self.status_label.setText("Навчання моделі прогнозування...")
+
+    def _on_train_progress(self, message: str):
+        if hasattr(self, '_train_progress') and self._train_progress:
+            self._train_progress.setLabelText(message)
+        self.status_label.setText(message)
+
+    def _on_train_finished(self, summary: str):
+        if hasattr(self, '_train_progress') and self._train_progress:
+            self._train_progress.close()
+            self._train_progress = None
+        QMessageBox.information(self, "Навчання завершено", summary)
+        self.status_label.setText("Навчання завершено.")
+        self._refresh_from_db()
+
+    def _on_train_error(self, error_msg: str):
+        if hasattr(self, '_train_progress') and self._train_progress:
+            self._train_progress.close()
+            self._train_progress = None
+        self.status_label.setText(f"Помилка: {error_msg}")
+        QMessageBox.critical(self, "Помилка навчання", error_msg)
+
+    def _run_predictor_model(self):
+        """Run the stock return predictor on all database news."""
+        if self._predict_worker and self._predict_worker.isRunning():
+            QMessageBox.warning(self, "Зайнято", "Прогнозування вже виконується.")
+            return
+
+        self._predict_progress = QProgressDialog(
+            "Підготовка прогнозування...", "Скасувати", 0, 0, self
+        )
+        self._predict_progress.setWindowTitle("Прогнозування")
+        self._predict_progress.setWindowModality(Qt.WindowModality.WindowModal)
+        self._predict_progress.setMinimumDuration(0)
+        self._predict_progress.show()
+
+        self._predict_worker = PredictWorker(self.db, self)
+        self._predict_worker.progress.connect(self._on_predict_progress)
+        self._predict_worker.finished.connect(self._on_predict_finished)
+        self._predict_worker.error.connect(self._on_predict_error)
+
+        self._predict_progress.canceled.connect(self._predict_worker.requestInterruption)
+        self._predict_worker.start()
+        self.status_label.setText("Прогнозування...")
+
+    def _on_predict_progress(self, message: str):
+        if hasattr(self, '_predict_progress') and self._predict_progress:
+            self._predict_progress.setLabelText(message)
+        self.status_label.setText(message)
+
+    def _on_predict_finished(self, count: int):
+        if hasattr(self, '_predict_progress') and self._predict_progress:
+            self._predict_progress.close()
+            self._predict_progress = None
+        QMessageBox.information(
+            self, "Успіх",
+            f"Спрогнозовано зміни цін для {count} новин."
+        )
+        self.status_label.setText(f"Спрогнозовано {count} новин.")
+        self._refresh_from_db()
+
+    def _on_predict_error(self, error_msg: str):
+        if hasattr(self, '_predict_progress') and self._predict_progress:
+            self._predict_progress.close()
+            self._predict_progress = None
+        self.status_label.setText(f"Помилка: {error_msg}")
+        QMessageBox.critical(self, "Помилка прогнозування", error_msg)
+
     def closeEvent(self, event):
-        """Ensure background threads are stopped on exit."""
-        if self._fetch_worker and self._fetch_worker.isRunning():
-            self._fetch_worker.terminate()
-            self._fetch_worker.wait(3000)
-        if self._reclass_worker and self._reclass_worker.isRunning():
-            self._reclass_worker.terminate()
-            self._reclass_worker.wait(3000)
+        """Ensure background threads are gracefully stopped on exit."""
+        # Зупиняємо воркер авто-панелі
+        if hasattr(self, 'auto_panel') and self.auto_panel._worker and self.auto_panel._worker.isRunning():
+            self.auto_panel._worker.requestInterruption()
+            self.auto_panel._worker.wait(5000)
+
+        for worker_name in ['_fetch_worker', '_reclass_worker', '_align_worker', '_train_worker', '_predict_worker']:
+            worker = getattr(self, worker_name, None)
+            if worker and worker.isRunning():
+                worker.requestInterruption()
+                if not worker.wait(5000):
+                    logger.warning("Worker %s did not stop in time, forcing terminate.", worker_name)
+                    worker.terminate()
+                    worker.wait(2000)
+        self.db.close()
         event.accept()
